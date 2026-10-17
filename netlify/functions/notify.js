@@ -50,37 +50,27 @@ exports.handler = async (event) => {
     return `• ${r.item || r.code}${who}\n  ${qty} — ${r.batch}`;
   };
 
-  // Group by manufacturing date so several days never blur into one figure.
+  // One message per manufacturing day, each with that day's own totals.
   const byDate = {};
   rows.forEach((r) => {
     const d = r.date || p.date || "undated";
     (byDate[d] = byDate[d] || []).push(r);
   });
   const days = Object.keys(byDate).sort();
-
   const sum = (list, f) => list.reduce((a, r) => a + (parseFloat(r[f]) || 0), 0);
+  const nice = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d) ? d.slice(8, 10) + "/" + d.slice(5, 7) + "/" + d.slice(0, 4) : d;
 
-  const lines = days.map((d) => {
+  const messages = days.map((d, i) => {
     const g = byDate[d];
     const c = sum(g, "ctn"), pk = sum(g, "pac");
-    const head = days.length > 1 ? `\n── ${d} ──\n` : "";
-    const foot = days.length > 1
-      ? `\n   ${d} subtotal: ${c} ctn` + (pk ? `, ${pk} pac` : "")
-      : "";
-    return head + g.map(oneLine).join("\n") + foot;
-  }).join("\n");
-
-  const totalCtn = sum(rows, "ctn");
-  const totalPac = sum(rows, "pac");
-
-  const span = days.length > 1 ? `${days[0]} to ${days[days.length - 1]}` : (days[0] || p.date);
-  const heading = p.kind === "summary"
-    ? `PRODUCTION SUMMARY — ${span}`
-    : `Production recorded — ${span} / ${p.shift}`;
-
-  const text = `${heading}\n\n${lines}\n\n` +
-    `TOTAL: ${totalCtn} cartons` + (totalPac ? `, ${totalPac} loose packs` : "") +
-    `\n${rows.length} lines` + (days.length > 1 ? ` across ${days.length} days` : "");
+    const shifts = [...new Set(g.map((r) => r.shift || p.shift).filter(Boolean))].join(", ");
+    const heading = (p.kind === "summary" ? "DAILY PRODUCTION REPORT" : "Production recorded") +
+      ` — ${nice(d)}` + (shifts ? ` / ${shifts}` : "") + (days.length > 1 ? `  (${i + 1} of ${days.length})` : "");
+    const lines = g.map(oneLine).join("\n");
+    const total = `${c} ctn` + (pk ? `, ${pk} pac` : "");
+    return { date: nice(d), shift: shifts, lines, total,
+      text: `${heading}\n\n${lines}\n\nDAY TOTAL: ${c} cartons` + (pk ? `, ${pk} loose packs` : "") + `\n${g.length} lines` };
+  });
 
   const prefix = channel === "whatsapp" ? "whatsapp:" : "";
   const sender = from.startsWith("whatsapp:") || channel !== "whatsapp" ? from : prefix + from;
@@ -90,39 +80,39 @@ exports.handler = async (event) => {
   const auth = "Basic " + Buffer.from(`${sid}:${token}`).toString("base64");
 
   const results = [];
-  for (const n of recipients) {
-    const form = new URLSearchParams();
-    form.set("From", sender);
-    form.set("To", prefix + n.replace(/^whatsapp:/, ""));
-
-    if (channel === "whatsapp" && contentSid) {
-      form.set("ContentSid", contentSid);
-      form.set("ContentVariables", JSON.stringify({
-        1: p.date,
-        2: p.shift || "",
-        3: lines.slice(0, 900),
-        4: `${totalCtn} ctn` + (totalPac ? `, ${totalPac} pac` : ""),
-      }));
-    } else {
-      form.set("Body", text);
-    }
-
-    try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
-        body: form.toString(),
-      });
-      const d = await r.json();
-      if (!r.ok) {
-        console.error("Twilio error", d);
-        results.push({ to: n, ok: false, error: d.message, code: d.code });
+  for (const m of messages) {
+    for (const n of recipients) {
+      const form = new URLSearchParams();
+      form.set("From", sender);
+      form.set("To", prefix + n.replace(/^whatsapp:/, ""));
+      if (channel === "whatsapp" && contentSid) {
+        form.set("ContentSid", contentSid);
+        form.set("ContentVariables", JSON.stringify({
+          1: m.date,
+          2: m.shift || p.shift || "",
+          3: m.lines.length > 900 ? m.lines.slice(0, 880) + "\n…(more in Google Sheet)" : m.lines,
+          4: m.total,
+        }));
       } else {
-        results.push({ to: n, ok: true, sid: d.sid, status: d.status });
+        form.set("Body", m.text);
       }
-    } catch (err) {
-      console.error(err);
-      results.push({ to: n, ok: false, error: "Could not reach Twilio" });
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
+          body: form.toString(),
+        });
+        const d = await r.json();
+        if (!r.ok) {
+          console.error("Twilio error", d);
+          results.push({ to: n, day: m.date, ok: false, error: d.message, code: d.code });
+        } else {
+          results.push({ to: n, day: m.date, ok: true, sid: d.sid, status: d.status });
+        }
+      } catch (err) {
+        console.error(err);
+        results.push({ to: n, day: m.date, ok: false, error: "Could not reach Twilio" });
+      }
     }
   }
 
@@ -130,5 +120,5 @@ exports.handler = async (event) => {
   if (failed.length === results.length) {
     return json(502, { error: failed[0].error || "Message not accepted", results });
   }
-  return json(200, { ok: true, results });
+  return json(200, { ok: true, days: messages.length, results });
 };
