@@ -18,8 +18,8 @@ exports.handler = async (event) => {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) return json(500, { error: "ANTHROPIC_API_KEY is not set on this site" });
 
-  let b64, media, prompt;
-  try { ({ b64, media, prompt } = JSON.parse(event.body || "{}")); }
+  let b64, media, prompt, images;
+  try { ({ b64, media, prompt, images } = JSON.parse(event.body || "{}")); }
   catch { return json(400, { error: "Bad request body" }); }
   if (!b64 || !prompt) return json(400, { error: "Missing photo or prompt" });
 
@@ -32,12 +32,14 @@ exports.handler = async (event) => {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 2000,
+        model: process.env.READER_MODEL || "claude-opus-5-5",
+        max_tokens: 4000,
         messages: [{
           role: "user",
           content: [
             { type: "image", source: { type: "base64", media_type: media || "image/jpeg", data: b64 } },
+            // zoomed crops of the same sheet (top table, bottom manpower) for small handwriting
+            ...(Array.isArray(images) ? images.slice(0, 3) : []).map((d) => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: d } })),
             { type: "text", text: prompt },
           ],
         }],
